@@ -5,6 +5,8 @@ from dlinfer.utils.type_annotation import Tensor, Optional, Sequence, Tuple
 from dlinfer.graph.custom_op import register_custom_op
 from dlinfer.vendor import linear_w8a8_scale_type, dynamic_quant_scale_type
 
+from typing import List
+
 
 __all__ = [
     "add_rms_norm",
@@ -594,6 +596,7 @@ def fused_moe_with_alltoall(
     num_experts: int,
     ep_size: int,
     renormalize: bool,
+    expert_list: List[int] = None,
 ) -> Tensor:
     """
     Implement the Fused Mixture of Experts (MoE) model.
@@ -623,6 +626,7 @@ def fused_moe_with_alltoall(
         num_experts,
         ep_size,
         renormalize,
+        expert_list,
     )
 
 
