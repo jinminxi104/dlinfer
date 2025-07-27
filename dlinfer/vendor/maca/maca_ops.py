@@ -18,6 +18,7 @@ from typing import List
 from dlinfer.vendor import vendor_ops_registry
 from dlinfer.utils.registry import register_ops
 from dlinfer.utils.type_annotation import Tensor, Optional, Sequence, Tuple
+from typing import Any
 
 from .maca_extension import ops as maca_ext_ops
 from .context_flashattention import (
@@ -213,9 +214,13 @@ def fill_kv_cache(
     quant_bits: int,
 ) -> Tuple[Tensor, Tensor]:
     kv_indices = kv_indices.squeeze(-1)
-    maca_ext_ops.reshape_and_cache_new(
-        key, value, key_cache, value_cache, kv_indices, "auto", 1.0, 1.0
-    )
+    key_cache = key_cache.reshape(-1,1,576)
+    key_cache[kv_indices] = key
+    #if key.shape[0] < 2:
+    #    import fpdb;fpdb.ForkedPdb().set_trace()
+    #maca_ext_ops.reshape_and_cache_new(
+    #    key, value, key_cache, value_cache, kv_indices, "auto", 1.0, 1.0
+    #)
     return key_cache, value_cache
 
 
@@ -236,6 +241,7 @@ def paged_decode_attention(
     kv_scales: Optional[Tensor],
     kv_zeros: Optional[Tensor],
     quant_bits: Optional[int],
+    flashinfer_wrapper: Optional[Any] = None,
 ) -> Tensor:
     if alibi_slopes is not None:
         raise RuntimeError("paged_decode_attention does not support alibi_slopes yet")
@@ -247,6 +253,24 @@ def paged_decode_attention(
     output = torch.empty_like(query)
 
     is_mla = query.size(-1) == 576
+
+    #import fpdb;fpdb.ForkedPdb().set_trace()
+    reshaped_q = query.view(-1, num_q_heads, 576)
+    #reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+    k_buffer = key_cache#forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+    reshaped_k = k_buffer.view(-1, 16, 576)
+    #reshaped_k = k_buffer.view(-1, 1, 576)
+    #import fpdb;fpdb.ForkedPdb().set_trace()
+    v_head_dim = 512
+    o = flashinfer_wrapper.run(
+        reshaped_q[:, :, : v_head_dim],
+        reshaped_q[:, :, v_head_dim :],
+        reshaped_k[:, :, : v_head_dim],
+        reshaped_k[:, :, v_head_dim :],
+    )
+    #print("passed!!!!", flush=True)
+    #import fpdb;fpdb.ForkedPdb().set_trace()
+    return o
 
     if is_mla:
         value_cache = key_cache.transpose(2, 3).reshape(
