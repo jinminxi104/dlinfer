@@ -215,8 +215,13 @@ def next_power_of_2(n: int):
         return 4                                                              
     if n <= 8:                                                                
         return 8                                                              
+    if n > 3072:
+        return 4096
+    if n > 2048:
+        return 3072
     if n > 1024:
         return 1200
+        #return 2048
     if n > 512:
         return 1024
     if n > 256:
@@ -243,7 +248,11 @@ def _get_capture_batch_size_impl(max_batches: int):
     if max_batches != ret[-1]:
         ret.append(max_batches)
     '''
+    #ret = [1, 2, 4, 8, 16, 32, 48, 64]
+    #ret = [1, 2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 512, 1024, 2048, 3072, 4096]
     ret = [1, 2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 512, 1024, 1200]
+    #ret = [1, 2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128]
+    #ret = [1, 2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256]
     return ret
 
 
@@ -299,11 +308,13 @@ class AscendSingleGraphRunner:
         current_stream = torch.cuda.current_stream()
 
         aclgraph = torch.npu.NPUGraph()
-        with ExitStack() as stack:
-            stack.enter_context(patch("gc.collect", lambda: None))
-            stack.enter_context(patch("torch.npu.empty_cache", lambda: None))
-            with torch.npu.graph(aclgraph, auto_dispatch_capture=True, pool=self.pool, stream=current_stream):
-                output = self.model(**padded_kwargs)
+        logger.error(f'inputsssss: {padded_kwargs["input_ids"].shape}')
+        #with ExitStack() as stack:
+            #stack.enter_context(patch("gc.collect", lambda: None))
+            #stack.enter_context(patch("torch.npu.empty_cache", lambda: None))
+            #logger.error(f'rank {dist.get_rank()}  poooooooool: {self.pool}')
+        with torch.npu.graph(aclgraph, auto_dispatch_capture=True, pool=self.pool, stream=current_stream):
+            output = self.model(**padded_kwargs)
 
         output_buffers = dict(logits=output)
         self.meta.output_buffers = output_buffers
@@ -330,8 +341,12 @@ class AscendSingleGraphRunner:
             logger.error(f'loss time rank {dist.get_rank()}  {totalt}')
         cnt += 1
         '''
+        #st = time.time()
         self._graph.replay()
         self._graph.update(cpu_update_input=[{"actual_seq_lengths_kv": self.meta.input_buffers["kv_seqlens"]}])
+        #torch.npu.synchronize()
+        #timediff = time.time() - st
+        #logger.error(f'{dist.get_rank()}: time  {timediff}')
 
         output = self.meta.output_buffers['logits'][:, :num_tokens]
         return output
@@ -355,7 +370,7 @@ class AscendGraphRunner(GraphRunner):
         # import dlinfer.graph
         # dlinfer.graph.config.enable_graph_mode = True
 
-        self.graph_pool_handle = torch.cuda.graph_pool_handle()
+        self.graph_pool_handle = torch.npu.graph_pool_handle()
         self._runner_map: Dict[Any, AscendSingleGraphRunner] = dict()
         self.has_try_compile_model: bool = False
 
@@ -414,7 +429,7 @@ class AscendGraphRunner(GraphRunner):
                 #torch.npu.synchronize()
                 #end_t = time.time()
                 #if dist.get_rank() == 0:
-                #    logger.error(f"prefill eager: {end_t - start_t} rank: {dist.get_rank()}")
+                #logger.error(f"prefill eager: {end_t - start_t} rank: {dist.get_rank()}")
                 return ret
 
         graph_key = self.get_graph_key(**kwargs)

@@ -8,6 +8,10 @@ from dlinfer.utils.registry import register_ops
 from dlinfer.utils.type_annotation import Tensor, Optional, Sequence, Tuple
 from .utils import SocVersion
 
+from lmdeploy.utils import get_logger
+logger = get_logger('lmdeploy')
+
+
 __all__ = [
     "add_rms_norm",
     "apply_rotary_pos_emb",
@@ -521,15 +525,89 @@ def fused_moe(
     topk: int,
     renormalize: bool,
 ) -> Tensor:
-    seq_length = hidden_states.size(0)
+    return hidden_states
     num_experts = gate_up_weights.size(0)
-    active_num = hidden_states.size(0)
+    active_num = hidden_states.size(0) * topk
     topk_ids = topk_ids.to(torch.int32)
-
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     if not topk_weights.is_contiguous():
         topk_weights = topk_weights.contiguous()
+    # moe init routing
+    expanded_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
+        torch.ops.npu.npu_moe_init_routing_v2(
+            hidden_states,
+            topk_ids,
+            active_num=active_num,
+            expert_num=num_experts,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, num_experts],
+            quant_mode= -1,
+        ))
+    #print(f"++++++++++++++++++++++++++++ {expanded_hidden_states.shape}", flush=True)
+    # up sample
+    group_list = expert_tokens.to(torch.int64)
+
+
+    up_proj = torch.ops.npu.npu_grouped_matmul(
+        [expanded_hidden_states],
+        [gate_up_weights],
+        bias=None,
+        group_list=group_list,
+        split_item=2,
+        group_type=0,
+        group_list_type=1,
+    )[0]
+    # activation
+    gate_cache = silu_and_mul(up_proj, -1)
+    # down sample
+
+    if torch.distributed.get_rank() == 0:
+        logger.error(f'rank {torch.distributed.get_rank()} pMoe+++4:, {torch.npu.mem_get_info(0)}, {gate_cache.shape} {up_proj.shape} {down_weights.shape}')
+    #tmp_tensor = torch.ones(gate_cache.shape[-1], 4096).to(gate_cache.dtype).to(gate_cache.device)
+    down_proj = torch.matmul(gate_cache, down_weights[0])
+    #del up_proj
+
+    '''
+    down_proj = torch.ops.npu.npu_grouped_matmul(
+        [gate_cache],
+        [down_weights],
+        bias=None,
+        group_list=group_list,
+        split_item=2,
+        group_type=0,
+        group_list_type=1,
+    )[0]
+    '''
+    if torch.distributed.get_rank() == 0:
+        logger.error(f'rank {torch.distributed.get_rank()} pMoe+++5:, {torch.npu.mem_get_info(0)}, {down_proj.shape}')
+
+
+    # moe finalize routing
+    moe_output = torch_npu.npu_moe_token_unpermute(
+        permuted_tokens=down_proj,
+        sorted_indices=expanded_row_idx,
+        probs=topk_weights)
+    return moe_output
+
+'''
+@register_ops(vendor_ops_registry)
+def fused_moe(
+    hidden_states: Tensor,
+    gate_up_weights: Tensor,
+    down_weights: Tensor,
+    topk_weights: Tensor,
+    topk_ids: Tensor,
+    topk: int,
+    renormalize: bool,
+) -> Tensor:
+    #if torch.cuda.empty_cache:
+    #    torch.cuda.empty_cache()
+    seq_length = hidden_states.size(0)
+    num_experts = gate_up_weights.size(0)
+    active_num = hidden_states.size(0)
+    topk_ids = topk_ids.to(torch.int32)
 
     # moe init routing
     row_idx = (
@@ -538,14 +616,24 @@ def fused_moe(
         .transpose(0, 1)
         .contiguous()
     )
+    if torch.distributed.get_rank() == 0:
+        logger.error(f'rank {torch.distributed.get_rank()} pMoe---:, {torch.npu.mem_get_info(0)}')
     expanded_hidden_states, expanded_row_idx, expanded_expert_idx = (
         torch.ops.npu.npu_moe_init_routing(hidden_states, row_idx, topk_ids, active_num)
     )
+    if torch.distributed.get_rank() == 0:
+        logger.error(f'rank {torch.distributed.get_rank()} pMoe+++:, {torch.npu.mem_get_info(0)}')
+
+    print(f"rank: {torch.distributed.get_rank()} ++++++++++++++++++++++++++++{hidden_states.shape} {expanded_hidden_states.shape}", flush=True)
 
     # up sample
     group_list = torch.ops.npu.npu_moe_compute_expert_tokens(
         expanded_expert_idx, num_experts
     ).to(torch.int64)
+    if torch.distributed.get_rank() == 0:
+        logger.error(f'rank {torch.distributed.get_rank()} pMoe+++2:, {torch.npu.mem_get_info(0)}')
+
+
     up_proj = torch.ops.npu.npu_grouped_matmul(
         [expanded_hidden_states],
         [gate_up_weights],
@@ -555,9 +643,17 @@ def fused_moe(
         group_type=0,
         group_list_type=0,
     )[0]
+    if torch.distributed.get_rank() == 0:
+        logger.error(f'rank {torch.distributed.get_rank()} pMoe+++3:, {torch.npu.mem_get_info(0)}')
+
+
 
     # activation
     gate_cache = silu_and_mul(up_proj, -1)
+    if torch.distributed.get_rank() == 0:
+        logger.error(f'rank {torch.distributed.get_rank()} pMoe+++4:, {torch.npu.mem_get_info(0)}, {gate_cache.shape} {up_proj.shape}')
+    del up_proj
+
 
     # down sample
     down_proj = torch.ops.npu.npu_grouped_matmul(
@@ -569,6 +665,18 @@ def fused_moe(
         group_type=0,
         group_list_type=0,
     )[0]
+    if torch.distributed.get_rank() == 0:
+        logger.error(f'rank {torch.distributed.get_rank()} pMoe+++5:, {torch.npu.mem_get_info(0)}')
+
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    if not topk_weights.is_contiguous():
+        topk_weights = topk_weights.contiguous()
+
+    if torch.distributed.get_rank() == 0:
+        logger.error(f'rank {torch.distributed.get_rank()} pMoe+++6:, {torch.npu.mem_get_info(0)}')
+
 
     # moe finalize routing
     moe_output = torch.ops.npu.npu_moe_finalize_routing(
@@ -580,8 +688,13 @@ def fused_moe(
         expanded_src_to_dst_row=expanded_row_idx,
         export_for_source_row=topk_ids,
     )
+    #if torch.distributed.get_rank() == 0:
+    #    logger.error(f'rank {torch.distributed.get_rank()} p2:, {torch.npu.mem_get_info(0)}')
+    if torch.distributed.get_rank() == 0:
+        logger.error(f'rank {torch.distributed.get_rank()} pMoe+++7:, {torch.npu.mem_get_info(0)}')
 
     return moe_output
+'''
 
 
 @register_ops(vendor_ops_registry)
