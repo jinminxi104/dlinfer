@@ -525,7 +525,6 @@ def fused_moe(
     topk: int,
     renormalize: bool,
 ) -> Tensor:
-    return hidden_states
     num_experts = gate_up_weights.size(0)
     active_num = hidden_states.size(0) * topk
     topk_ids = topk_ids.to(torch.int32)
@@ -610,6 +609,7 @@ def fused_moe(
     topk_ids = topk_ids.to(torch.int32)
 
     # moe init routing
+<<<<<<< HEAD
     row_idx = (
         torch.arange(seq_length * topk, dtype=torch.int32, device=hidden_states.device)
         .view((topk, seq_length))
@@ -634,14 +634,29 @@ def fused_moe(
         logger.error(f'rank {torch.distributed.get_rank()} pMoe+++2:, {torch.npu.mem_get_info(0)}')
 
 
+=======
+    expanded_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
+        torch.ops.npu.npu_moe_init_routing_v2(
+            hidden_states,
+            topk_ids,
+            active_num=active_num,
+            expert_num=num_experts,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, num_experts],
+            quant_mode= -1,
+        ))
+
+    # up sample
+    group_list = expert_tokens.to(torch.int64)
+>>>>>>> fed72b36f453649dddf87802610ae31d6f951d3e
     up_proj = torch.ops.npu.npu_grouped_matmul(
         [expanded_hidden_states],
         [gate_up_weights],
-        bias=None,
         group_list=group_list,
         split_item=2,
         group_type=0,
-        group_list_type=0,
+        group_list_type=1,
     )[0]
     if torch.distributed.get_rank() == 0:
         logger.error(f'rank {torch.distributed.get_rank()} pMoe+++3:, {torch.npu.mem_get_info(0)}')
@@ -659,11 +674,10 @@ def fused_moe(
     down_proj = torch.ops.npu.npu_grouped_matmul(
         [gate_cache],
         [down_weights],
-        bias=None,
         group_list=group_list,
         split_item=2,
         group_type=0,
-        group_list_type=0,
+        group_list_type=1,
     )[0]
     if torch.distributed.get_rank() == 0:
         logger.error(f'rank {torch.distributed.get_rank()} pMoe+++5:, {torch.npu.mem_get_info(0)}')
@@ -679,6 +693,7 @@ def fused_moe(
 
 
     # moe finalize routing
+<<<<<<< HEAD
     moe_output = torch.ops.npu.npu_moe_finalize_routing(
         down_proj,
         skip1=None,
@@ -692,6 +707,12 @@ def fused_moe(
     #    logger.error(f'rank {torch.distributed.get_rank()} p2:, {torch.npu.mem_get_info(0)}')
     if torch.distributed.get_rank() == 0:
         logger.error(f'rank {torch.distributed.get_rank()} pMoe+++7:, {torch.npu.mem_get_info(0)}')
+=======
+    moe_output = torch_npu.npu_moe_token_unpermute(
+        permuted_tokens=down_proj,
+        sorted_indices=expanded_row_idx,
+        probs=topk_weights)
+>>>>>>> fed72b36f453649dddf87802610ae31d6f951d3e
 
     return moe_output
 '''
