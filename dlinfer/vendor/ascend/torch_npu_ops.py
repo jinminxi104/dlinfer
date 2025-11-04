@@ -38,6 +38,7 @@ def add_rms_norm(
     return normed_hidden_states, added_hidden_states
 
 
+import torch_npu
 @register_ops(vendor_ops_registry)
 def apply_rotary_pos_emb(
     query: Tensor,
@@ -52,7 +53,7 @@ def apply_rotary_pos_emb(
     batch, seq_len, _, _ = query.shape
     cos = cos.reshape(batch, seq_len, 1, -1)
     sin = sin.reshape(batch, seq_len, 1, -1)
-
+ 
     def rotate_half_(x):
         x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
@@ -62,7 +63,18 @@ def apply_rotary_pos_emb(
 
     # ascend ops currently only support dim 128
     if query.shape[-1] != 128 or key.shape[-1] != 128:
-        return apply_rotary_pos_emb_(query, key, cos, sin)
+        if True: # cos.shape == sin.shape:
+            print('use custom rotary pos emb implementation')
+            cos = cos.reshape(batch, seq_len, 1, -1)
+            sin = sin.reshape(batch, seq_len, 1, -1)
+            return apply_rotary_pos_emb_(query, key, cos, sin)
+        else:
+            print('use npu_apply_rotary_pos_emb implementation')
+            query = query.view(query.shape[0]*query.shape[1],query.shape[2]*query.shape[3])
+            key = key.view(key.shape[0]*key.shape[1],key.shape[2]*key.shape[3])
+            mrope_section = [8, 12, 12]
+            head_size = 64
+            return torch_npu.npu_mrope(sin, query, key, cos.npu().to(torch.bfloat16), head_size, mrope_section=mrope_section, rotary_mode='half')
     return torch.ops.npu.npu_apply_rotary_pos_emb(query, key, cos, sin, "BSND")
 
 
@@ -243,6 +255,7 @@ def paged_decode_attention(
     value_cache = value_cache.view(block_num, block_size, -1)
     scale_value = softmax_scale if softmax_scale else 1.0 / math.sqrt(dim)
 
+    #print('actual_kv_seq_len kv :', kv_seq_len)
     attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
         query,
         key_cache,

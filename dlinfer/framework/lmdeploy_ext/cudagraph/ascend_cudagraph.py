@@ -253,6 +253,7 @@ class AscendSingleGraphRunner:
         self.model.fill_buffers_cudagraph(self.meta, **kwargs)
         context = self.ctx_mgr.current_context()
         self.model.update_context_cudagraph(self.meta, context)
+        #import pdb; pdb.set_trace()
         torch.npu.synchronize()
         self._graph.replay()
         self._graph.update(
@@ -327,6 +328,7 @@ class AscendGraphRunner(GraphRunner):
 
         if not enable_graph:
             with record_function("forward_eager"):
+                #print(f"444444444444: {kwargs}")
                 ret = self.model(**kwargs)
                 return ret
 

@@ -18,6 +18,7 @@ if os.getenv("DLINFER_RESET_MOE_UPDATE_WEIGHTS", "0") == "1":
     DlinferFusedMoEImpl.update_weights = rl_update_weights
 
 
+''
 @staticmethod
 def ascend_chatglm2_fill_rope(states: torch.Tensor, rope: torch.Tensor):
     """fill rope."""
@@ -29,7 +30,7 @@ def ascend_chatglm2_fill_rope(states: torch.Tensor, rope: torch.Tensor):
     return states
 
 
-SelfAttention._fill_rope = ascend_chatglm2_fill_rope
+#SelfAttention._fill_rope = ascend_chatglm2_fill_rope
 
 
 # modify bad words process for aclgraph performance
