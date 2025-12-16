@@ -540,6 +540,13 @@ def fused_moe(
     topk: int,
     renormalize: bool,
 ) -> Tensor:
+    """
+    Fused MoE implementation for Ascend.
+    
+    Note: This implementation maintains the original API for backward compatibility.
+    The newer All2All EP MoE implementation is available in dlinfer.ops.ascend.fused_moe
+    for distributed EP workloads that need to work from router_logits directly.
+    """
     num_experts = gate_up_weights.size(0)
     active_num = hidden_states.size(0) * topk
     topk_ids = topk_ids.to(torch.int32)
