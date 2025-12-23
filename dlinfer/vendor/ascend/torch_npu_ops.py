@@ -26,6 +26,7 @@ __all__ = [
     "get_cache_len",
     "weight_quant_matmul",
     "fused_moe",
+    "fused_moe_all2all",
     "linear",
     "rms_norm_w8a8",
     "add_rms_norm_w8a8",
@@ -653,6 +654,63 @@ def fused_moe(
     )
 
     return moe_output
+
+
+@register_ops(vendor_ops_registry)
+def fused_moe_all2all(
+    hidden_states: Tensor,
+    router_logits: Tensor,
+    *,
+    moe_config,
+    ep_group,
+    ep_rank: int,
+    ep_size: int,
+    expert_kernel,
+    expert_kwargs: Optional[dict] = None,
+    apply_router_weight_on_input: bool = False,
+    normalize_router_logits: bool = False,
+    quant_type = None,
+    bias: Optional[Tensor] = None,
+) -> Tensor:
+    """
+    All2All EP MoE implementation for Ascend.
+    
+    This implements expert-parallel MoE using All2All communication.
+    It is the recommended implementation for distributed MoE scenarios.
+    
+    Args:
+        hidden_states: Input tensor [N_tokens, H_total]
+        router_logits: Router output before softmax [N_tokens, num_experts]
+        moe_config: MoE configuration with num_experts, num_local_experts, experts_per_token
+        ep_group: Expert-parallel process group
+        ep_rank: Rank in EP group
+        ep_size: Size of EP group
+        expert_kernel: Function to compute expert outputs
+        expert_kwargs: Additional kwargs for expert_kernel
+        apply_router_weight_on_input: Whether to apply router weights before expert computation
+        normalize_router_logits: Whether to normalize router logits
+        quant_type: Quantization type if any
+        bias: Optional bias tensor
+        
+    Returns:
+        Output tensor after MoE computation
+    """
+    from dlinfer.ops.moe.common_fused_moe import forward_impl_all2all
+    
+    return forward_impl_all2all(
+        hidden_states,
+        router_logits,
+        moe_config=moe_config,
+        ep_group=ep_group,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        expert_kernel=expert_kernel,
+        expert_kwargs=expert_kwargs,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        normalize_router_logits=normalize_router_logits,
+        quant_type=quant_type,
+        bias=bias,
+    )
 
 
 @register_ops(vendor_ops_registry)
