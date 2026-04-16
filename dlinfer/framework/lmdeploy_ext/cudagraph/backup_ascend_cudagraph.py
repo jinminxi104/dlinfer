@@ -18,7 +18,6 @@ from lmdeploy.pytorch.model_inputs import StepContext, get_step_ctx_manager
 from lmdeploy.pytorch.backends.graph_runner import GraphRunner
 
 from lmdeploy.utils import get_logger
-from ....utils import weak_ref_tensors
 
 logger = get_logger("dlinfer")
 BuffType = Dict[str, Tensor]
@@ -36,7 +35,7 @@ def aclgraph_use_torch_npu_update():
 
     return current_version >= min_valid_version
     '''
-    return False
+    return True
 
 
 # AscendCudaGraphMixin methods for cudagraph buffer management.
@@ -344,7 +343,7 @@ class AscendSingleGraphRunner:
             AscendGraphRunner.capturing = True
             with torch.npu.graph(
                 aclgraph,
-                #auto_dispatch_capture=True,
+                auto_dispatch_capture=True,
                 pool=self.pool,
                 stream=current_stream,
             ):
@@ -355,7 +354,7 @@ class AscendSingleGraphRunner:
 
 
         # output_buffers = dict(logits=output)
-        output_buffers = self.model.make_output_buffers(weak_ref_tensors(graph_output))
+        output_buffers = self.model.make_output_buffers(graph_output)
 
         self.meta.output_buffers = output_buffers
         self._graph = aclgraph
@@ -372,18 +371,16 @@ class AscendSingleGraphRunner:
         self.model.fill_buffers_cudagraph(self.meta, **kwargs)
         context = self.ctx_mgr.current_context()
         self.model.update_context_cudagraph(self.meta, context)
-        if False:#aclgraph_use_torch_npu_update():
-            torch.npu.synchronize()
-            self._graph.replay()
+        if aclgraph_use_torch_npu_update():
             self._graph.update(
                 cpu_update_input=[
                     {"actual_seq_lengths_kv": self.meta.input_buffers["kv_seqlens"]}
                 ]
             )
-        else:
-            torch.npu.synchronize()
             self._graph.replay()
+        else:
             update_attn_params(self.update_stream, self.meta, self.max_tokens)
+            self._graph.replay()
         # output = self.meta.output_buffers["logits"][:, :num_tokens]
         output_buffers = self.meta.output_buffers
         output = self.model.get_outputs_cudagraph(output_buffers, **kwargs)
@@ -397,9 +394,6 @@ class AscendSingleGraphRunner:
                     self._graph.reset()
             finally:
                 self._graph = None
-
-        if hasattr(self.meta, "input_buffers") and isinstance(self.meta.input_buffers, dict):
-            self.meta.input_buffers.clear()
 
         if hasattr(self.meta, "output_buffers") and isinstance(
             self.meta.output_buffers, dict
@@ -507,7 +501,7 @@ class AscendGraphRunner(GraphRunner):
         else:
             runner = self._runner_map[graph_key]
             output = runner.forward(**kwargs)
-            #torch.npu.synchronize()
+            torch.npu.synchronize()
         #print(f"replayyyyyyyyyyyyyyyy", flush=True)
         #output = runner.forward(**kwargs)
         return output
@@ -592,10 +586,6 @@ def set_graph_params(aclgraph_capture_sizes: set[int]):
 def get_graph_params():
     return _graph_params
 
-def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
-    global _graph_params
-    if _graph_params is not None:
-        _graph_params.workspaces[num_tokens] = workspace
 
 def clear_graph_params():
     """Clear global graph params and release references to KV cache tensors."""
@@ -635,36 +625,25 @@ def update_attn_params(update_stream, forward_meta, runtime_size):
             key_cache,
             value_cache,
             num_kv_heads,
-            num_q_heads,
-            scale_value,
-            block_size,
+            num_heads,
+            scale,
             block_table,
-            q_seqlens,
-            kv_seq_len,
-            attn_output,
-            softmax_lse
+            seq_lens,
+            output,
         ) = param
-        kv_seq_len = forward_meta.input_buffers["kv_seqlens"]
-        workspace = get_graph_params().workspaces.get(runtime_size)
+        seq_lens = forward_meta.input_buffers["kv_seqlens"]
         with torch.npu.stream(update_stream):
             torch.npu.graph_task_update_begin(update_stream, handle)
-            torch.ops.npu.npu_fused_infer_attention_score.out(
+            torch.ops.atb._npu_paged_attention(
                 query=query,
-                key=key_cache,
-                value=value_cache,
-                atten_mask=None,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                num_kv_heads=num_kv_heads,
+                num_heads=num_heads,
+                scale_value=scale,
                 block_table=block_table,
-                input_layout="TND",
-                block_size=block_size,
-                actual_seq_lengths=q_seqlens,
-                actual_seq_lengths_kv=kv_seq_len,
-                num_key_value_heads=num_kv_heads,
-                num_heads=num_q_heads,
-                scale=scale_value,
-                sparse_mode=0,
-                workspace=workspace,
-                out = [attn_output, softmax_lse]
+                context_lens=seq_lens,
+                out=output,
             )
-
             torch.npu.graph_task_update_end(update_stream)
             event.record(update_stream)

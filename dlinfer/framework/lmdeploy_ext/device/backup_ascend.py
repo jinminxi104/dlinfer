@@ -592,7 +592,7 @@ class AscendCacheEngine:
         # Initialize the events for stream synchronization.
         self.events = torch.cuda.Event()
 
-        logger.error(
+        logger.debug(
             f"Initialize cache engine with {cache_config.num_gpu_blocks}"
             f" gpu blocks and {cache_config.num_cpu_blocks} cpu blocks."
         )
@@ -700,18 +700,18 @@ class AscendCacheEngine:
 
     def _allocate_cache(self, num_blocks: int, device: torch.device):
         """Allocate cache implement."""
-        import gc
-        gc.collect()
-        torch.npu.empty_cache()
+        #import gc
+        #gc.collect()
+        #torch.npu.empty_cache()
         key_block_shape = self.get_key_block_shape(local=True)
         value_block_shape = self.get_value_block_shape(local=True)
-        #key_msg = f"jinminxiiii key blocks: {num_blocks} layers {self.num_layers} x 128 x 128"
-        #logger.error(key_msg)
-        #free_bytes, total_bytes = torch.npu.mem_get_info()
-        #free_mem = f"free: {free_bytes/1024/1024} M"
-        #total_mem = f"total: {total_bytes/1024/1024} M"
-        #logger.error(free_mem)
-        #logger.error(total_mem)
+        key_msg = f"jinminxiiii key blocks: {num_blocks} layers {self.num_layers} x 128 x 128"
+        logger.error(key_msg)
+        free_bytes, total_bytes = torch.npu.mem_get_info()
+        free_mem = f"free: {free_bytes/1024/1024} M"
+        total_mem = f"total: {total_bytes/1024/1024} M"
+        logger.error(free_mem)
+        logger.error(total_mem)
 
         num_layers = self.num_layers
         kv_cache_dtype = self.kv_cache_dtype
@@ -747,6 +747,8 @@ class AscendCacheEngine:
 
     def allocate_gpu_cache(self):
         """Allocate caches on GPU."""
+        key_msg = f"jinminxiiii gpu cache alloc"
+        logger.error(key_msg)
         caches = self._allocate_cache(self.num_gpu_blocks, "cuda")
         self.full_gpu_cache = caches
         self.local_gpu_cache = list(zip(*caches))
@@ -754,6 +756,8 @@ class AscendCacheEngine:
 
     def allocate_cpu_cache(self):
         """Allocate caches on Host."""
+        key_msg = f"jinminxiiii cpu cache alloc"
+        logger.error(key_msg)
 
         caches = self._allocate_cache(self.num_cpu_blocks, "cpu")
 
