@@ -58,7 +58,7 @@ def decode_attention(
         )
         handle = torch.npu.graph_task_group_end(stream)
         graph_params.handles[num_tokens].append(handle)
-    else:
+    elif AscendGraphRunner.capturing:
         bs, _, dim = query.shape
         block_num = key_cache.size(0)
         query = query.contiguous()
@@ -66,6 +66,10 @@ def decode_attention(
         key_cache = key_cache.view(block_num, block_size, -1)
         value_cache = value_cache.view(block_num, block_size, -1)
         scale_value = softmax_scale if softmax_scale else 1.0 / math.sqrt(dim)
+        #num_tokens = query.shape[0]
+        #actual_seq_lengths_q = torch.arange(
+        #        1, num_tokens + 1, dtype=torch.int32, device=query.device
+        #        )
 
         attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
             query=query,
@@ -76,6 +80,39 @@ def decode_attention(
             input_layout="TND",
             block_size=block_size,
             actual_seq_lengths=q_seq_len,
+            actual_seq_lengths_kv=kv_seq_len,
+            num_key_value_heads=num_kv_heads,
+            num_heads=num_q_heads,
+            scale=scale_value,
+            sparse_mode=0,
+        )
+    else:
+        bs, _, dim = query.shape
+        block_num = key_cache.size(0)
+        query = query.contiguous()
+        attn_output = attn_output.contiguous()
+        key_cache = key_cache.view(block_num, block_size, -1)
+        value_cache = value_cache.view(block_num, block_size, -1)
+        scale_value = softmax_scale if softmax_scale else 1.0 / math.sqrt(dim)
+        num_tokens = query.shape[0]
+        actual_seq_lengths_q = torch.arange(
+                1, num_tokens + 1, dtype=torch.int32, device=query.device
+                )
+        '''
+        print(f"query shape: {query.shape}", flush=True)
+        print(f"q_seq_len: {q_seq_len}", flush=True)
+        print(f"actual_seq_lengths_q: {actual_seq_lengths_q.cpu()}", flush=True)
+        '''
+
+        attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            query=query,
+            key=key_cache,
+            value=value_cache,
+            atten_mask=None,
+            block_table=block_table,
+            input_layout="TND",
+            block_size=block_size,
+            actual_seq_lengths=actual_seq_lengths_q, #q_seq_len,
             actual_seq_lengths_kv=kv_seq_len,
             num_key_value_heads=num_kv_heads,
             num_heads=num_q_heads,

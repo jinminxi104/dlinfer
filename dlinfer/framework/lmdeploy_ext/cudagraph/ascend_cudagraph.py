@@ -431,7 +431,7 @@ class AscendGraphRunner(GraphRunner):
     ):
         """Get graph key."""
         context = self.ctx_mgr.current_context()
-        is_decoding = context.is_decoding
+        is_decoding = context.global_is_decoding()
         num_tokens = input_ids.numel()
         meta = self.get_meta()
         enable_microbatch = get_step_ctx_manager().current_context().enable_microbatch
@@ -440,6 +440,7 @@ class AscendGraphRunner(GraphRunner):
         else:
             new_num_tokens = self._get_capture_tokens(meta.padding_batch_size)
         return (new_num_tokens, is_decoding, enable_microbatch)
+
 
     def __call__(self, **kwargs):
         """call."""
@@ -510,7 +511,7 @@ class AscendGraphRunner(GraphRunner):
         """Update inputs."""
         if self.backend_config.eager_mode:
             return inputs
-        is_decoding = inputs.is_decoding
+        is_decoding = inputs.global_is_decoding()
         dp_meta = inputs.dp_meta
         if is_decoding and dp_meta is not None:
             meta = self.get_meta()
@@ -518,6 +519,18 @@ class AscendGraphRunner(GraphRunner):
             tp_size = self._get_capture_tokens(padding_batch_size)
             dp_meta.tp_sizes = [tp_size] * len(dp_meta.tp_sizes)
         return inputs
+        '''
+        if is_decoding and dp_meta is not None:
+            meta = self.get_meta()
+            padding_batch_size = meta.padding_batch_size
+            batch_size = inputs.seq_length.size(0)
+            query_len = inputs.input_ids.numel() // batch_size
+            tp_size = self._get_capture_tokens(padding_batch_size) * query_len
+            dp_meta.sync_tp_size(tp_size)
+        return inputs
+        '''
+
+
 
     def get_capture_batch_sizes(self) -> List[int]:
         """Capture batch sizes."""
