@@ -483,14 +483,18 @@ if SocVersion.is_Ascend310P():
         output = (key_cache, value_cache)
 
         if self.cache_config.quant_policy in (4, 8):
-            dtype = self.model_config.dtype
+            # INT8 uses one FP32 scale; INT4 uses two FP16 groups.  Both use
+            # the same scale bytes per token/KV-head and no zero point.
+            is_int4 = self.cache_config.quant_policy == 4
+            dtype = torch.float16 if is_int4 else torch.float32
+            scale_dim = 2 if is_int4 else 1
             key_sz_cache = torch.empty(
-                size=(num_layers, num_blocks, *key_block_shape[:-1], 2),
+                size=(num_layers, num_blocks, *key_block_shape[:-1], scale_dim),
                 dtype=dtype,
                 device=device,
             )
             val_sz_cache = torch.empty(
-                size=(num_layers, num_blocks, *value_block_shape[:-1], 2),
+                size=(num_layers, num_blocks, *value_block_shape[:-1], scale_dim),
                 dtype=dtype,
                 device=device,
             )

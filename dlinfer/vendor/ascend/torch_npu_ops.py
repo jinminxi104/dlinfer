@@ -15,7 +15,7 @@ from dlinfer.utils.type_annotation import (
     MoeMetadata,
 )
 from .utils import SocVersion, get_cpu_seq_len
-from .attention import decode_attention, decode_attention_mla
+from .attention import decode_attention, decode_attention_mla, prefill_attention_dynamic
 from . import moe
 
 __all__ = [
@@ -74,6 +74,35 @@ def dynamic_quant(
     assert quant_granularity == "PER_TOKEN"
     x, scale = torch.ops.npu.npu_dynamic_quant(hidden_states, dst_type=quant_dtype)
     return x, scale
+
+
+def dynamic_quant_int4(hidden_states: Tensor) -> Tuple[Tensor, Tensor]:
+    """Dynamically quantize and pack two signed INT4 values into one int8.
+
+    The installed NPU dynamic-quant op emits INT8 only.  INT4 KV keeps the
+    same symmetric, per-token/per-KV-head contract by computing its FP32
+    Two equal-sized groups are used per KV head.  Each group stores one FP16
+    scale, so its scale metadata takes the same bytes as INT8's one FP32 scale
+    per K/V head while substantially reducing INT4 quantization error.  The
+    raw 0..255 byte is shifted by -128 to use an int8 carrier, because Ascend
+    cache-write operators do not accept uint8 destinations.
+    """
+    if hidden_states.shape[-1] % 4:
+        raise ValueError("dynamic int4 KV cache requires a head dimension divisible by 4")
+    states = hidden_states.float()
+    group_count = 2
+    group_dim = states.shape[-1] // group_count
+    states = states.reshape(*states.shape[:-1], group_count, group_dim)
+    max_abs = states.abs().amax(dim=-1, keepdim=True)
+    # Preserve zero vectors exactly without making a zero scale that would
+    # produce NaNs during quantization.
+    scale = torch.where(max_abs > 0, max_abs / 7.0, torch.ones_like(max_abs))
+    quantized = torch.round(states / scale).clamp(-7, 7).to(torch.int16) + 8
+    low = quantized[..., 0::2]
+    high = quantized[..., 1::2]
+    packed = (low + high * 16 - 128).to(torch.int8)
+    packed = packed.reshape(*hidden_states.shape[:-1], hidden_states.shape[-1] // 2)
+    return packed, scale.squeeze(-1).to(torch.float16)
 
 
 @register_ops(vendor_ops_registry)
@@ -249,63 +278,19 @@ def incre_flash_attention(
     num_heads: int,
     input_layout: str,
     softmax_scale: Optional[float],
+    antiquant_scale: Optional[Tensor] = None,
+    antiquant_offset: Optional[Tensor] = None,
 ) -> Tensor:
-    attn_output = torch.ops.npu.npu_incre_flash_attention(
-        query,
-        key,
-        value,
+    kwargs = dict(
         num_heads=num_heads,
         input_layout=input_layout,
         scale_value=softmax_scale,
     )
-    return attn_output
-
-
-# atb._npu_reshape_and_cache has a performace advantage of about 3% compared to npu.npu_scatter_nd_update_,
-# but atb._npu_reshape_and_cache will report an error when slot_indices is an empty tensor.
-"""
-@register_ops(vendor_ops_registry)
-def fill_kv_cache(
-    key: Tensor,
-    value: Tensor,
-    key_cache: Tensor,
-    value_cache: Tensor,
-    kv_indices: Tensor,
-    k_scales_zeros: Sequence[Optional[Tensor]],
-    v_scales_zeros: Sequence[Optional[Tensor]],
-    quant_bits: int,
-) -> Tuple[Tensor, Tensor]:
-    _, head, dim = key.shape
-    block_num, block_size = key_cache.shape[:2]
-    block_total = block_num * block_size
-
-    # only support contiguous k,v
-    key = key.contiguous()
-    value = value.contiguous()
-    kv_indices = kv_indices.view(-1, 1)
-
-    if quant_bits == 8:
-
-        def quant_int8(x, x_scale, x_offset):
-            quantized = (
-                ((x / x_scale) - x_offset).round().clamp(-128, 127).to(torch.int8)
-            )
-            return quantized
-
-        key = quant_int8(key, k_scales_zeros[0], k_scales_zeros[1])
-        value = quant_int8(value, v_scales_zeros[0], v_scales_zeros[1])
-
-    is_mla = key.shape[-1] != value.shape[-1]
-    if is_mla:
-        key_cache_reshaped = key_cache.view(block_total, head, dim)
-        torch.ops.npu.npu_scatter_nd_update_(key_cache_reshaped, kv_indices, key)
-    else:
-        key_cache_reshaped = key_cache.view(block_total, head, dim)
-        value_cache_reshaped = value_cache.view(block_total, head, dim)
-        torch.ops.npu.npu_scatter_nd_update_(key_cache_reshaped, kv_indices, key)
-        torch.ops.npu.npu_scatter_nd_update_(value_cache_reshaped, kv_indices, value)
-    return key_cache, value_cache
-"""
+    if antiquant_scale is not None:
+        kwargs["antiquant_scale"] = antiquant_scale
+    if antiquant_offset is not None:
+        kwargs["antiquant_offset"] = antiquant_offset
+    return torch.ops.npu.npu_incre_flash_attention(query, key, value, **kwargs)
 
 
 @register_ops(vendor_ops_registry)
@@ -323,16 +308,33 @@ def fill_kv_cache(
     key = key.contiguous()
     value = value.contiguous()
 
-    if quant_bits == 8:
+    if quant_bits in (4, 8):
+        if key.shape[-1] != value.shape[-1]:
+            raise ValueError("dynamic INT4/INT8 KV cache does not support MLA cache layout")
+        if not isinstance(k_scales_zeros, torch.Tensor) or not isinstance(v_scales_zeros, torch.Tensor):
+            raise ValueError("dynamic INT4/INT8 KV cache requires scale cache tensors")
+        expected_scale_dim = 2 if quant_bits == 4 else 1
+        if k_scales_zeros.shape[-1] != expected_scale_dim or v_scales_zeros.shape[-1] != expected_scale_dim:
+            raise ValueError(
+                f"dynamic int{quant_bits} KV scale caches must end in size {expected_scale_dim}")
 
-        def quant_int8(x, x_scale, x_offset):
-            quantized = (
-                ((x / x_scale) - x_offset).round().clamp(-128, 127).to(torch.int8)
-            )
-            return quantized
-
-        key = quant_int8(key, k_scales_zeros[0], k_scales_zeros[1])
-        value = quant_int8(value, v_scales_zeros[0], v_scales_zeros[1])
+        if quant_bits == 8:
+            if key_cache.dtype != torch.int8 or value_cache.dtype != torch.int8:
+                raise ValueError("dynamic int8 KV cache requires int8 K/V cache tensors")
+            key, key_scale = torch.ops.npu.npu_dynamic_quant(key, dst_type=torch.int8)
+            value, value_scale = torch.ops.npu.npu_dynamic_quant(value, dst_type=torch.int8)
+        else:
+            if key_cache.dtype != torch.int8 or value_cache.dtype != torch.int8:
+                raise ValueError("dynamic int4 KV cache requires int8 packed K/V cache tensors")
+            key, key_scale = dynamic_quant_int4(key)
+            value, value_scale = dynamic_quant_int4(value)
+        key_params = key_scale if quant_bits == 4 else key_scale.unsqueeze(-1)
+        value_params = value_scale if quant_bits == 4 else value_scale.unsqueeze(-1)
+        key_params_cache = torch.flatten(k_scales_zeros, start_dim=0, end_dim=1)
+        value_params_cache = torch.flatten(v_scales_zeros, start_dim=0, end_dim=1)
+        scale_indices = kv_indices.view(-1, 1)
+        torch.ops.npu.npu_scatter_nd_update_(key_params_cache, scale_indices, key_params)
+        torch.ops.npu.npu_scatter_nd_update_(value_params_cache, scale_indices, value_params)
 
     is_mla = key.shape[-1] != value.shape[-1]
     if is_mla:
@@ -409,6 +411,9 @@ def paged_decode_attention(
             kv_seq_len=kv_seq_len,
             softmax_scale=softmax_scale,
             attn_output=attn_output,
+            key_scales_zeros=kv_scales,
+            value_scales_zeros=kv_zeros,
+            quant_bits=quant_bits,
         )
     else:
         return decode_attention_mla(
@@ -452,6 +457,25 @@ def paged_prefill_attention(
     if alibi_slopes is not None:
         raise RuntimeError(
             "paged_decode_attention does not " "support alibi_slopes yet"
+        )
+
+    if quant_bits in (4, 8):
+        if kv_scales is None or kv_zeros is None:
+            raise ValueError("dynamic INT4/INT8 KV cache requires K/V scale caches")
+        return prefill_attention_dynamic(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            block_size=block_size,
+            q_seq_len=q_seq_len,
+            kv_seq_len=kv_seq_len,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            softmax_scale=softmax_scale,
+            key_scales_zeros=kv_scales,
+            value_scales_zeros=kv_zeros,
+            quant_bits=quant_bits,
         )
 
     scale_value = softmax_scale if softmax_scale else 1.0 / math.sqrt(query.shape[-1])

@@ -165,6 +165,8 @@ def prefill_attention(
     ["query"],
     default_value={
         "softmax_scale": None,
+        "antiquant_scale": None,
+        "antiquant_offset": None,
     },
 )
 def incre_flash_attention(
@@ -174,6 +176,8 @@ def incre_flash_attention(
     num_heads: int,
     input_layout: str,
     softmax_scale: Optional[float],
+    antiquant_scale: Optional[Tensor] = None,
+    antiquant_offset: Optional[Tensor] = None,
 ) -> Tensor:
     """
     Computes the multi-head attention over the query, key, and value tensors.
@@ -196,6 +200,8 @@ def incre_flash_attention(
         num_heads,
         input_layout,
         softmax_scale,
+        antiquant_scale,
+        antiquant_offset,
     )
 
 
