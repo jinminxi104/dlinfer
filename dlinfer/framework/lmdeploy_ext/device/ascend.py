@@ -452,7 +452,7 @@ def _build_npu_profiler(self):
             f"Profiler start on {self.name}. "
             "Please Note that profiling might harm performance."
         )
-        profiler = npu_profile(activities=activities)
+        profiler = npu_profile(activities=activities, with_stack=True)
         return profiler
     else:
         return None

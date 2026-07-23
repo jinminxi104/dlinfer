@@ -4,6 +4,10 @@ import torch
 from functools import lru_cache
 from dlinfer.vendor import vendor_name
 
+from lmdeploy.utils import get_logger
+
+logger = get_logger('lmdeploy')
+
 vendor = ["camb", "ascend"]
 
 
@@ -234,6 +238,386 @@ def patch_state_cache_engine():
     cache_engine.StateCacheEngine.init_caches = _state_cache_engine_init_caches
 
 
+def patch_ascend_preserved_graph_sleep():
+    from lmdeploy.pytorch.engine.model_agent import agent as agent_mod
+    from lmdeploy.pytorch.weight_loader import model_weight_loader as weight_loader_mod
+    from dlinfer.framework.lmdeploy_ext.cudagraph.ascend_cudagraph import (
+        capture_graph_input_buffer_snapshot,
+    )
+
+    from . import ascend_graph_preserve
+
+    if getattr(agent_mod.BaseModelAgent, '_dlinfer_ascend_preserve_graph_patched', False):
+        return
+
+    if ascend_graph_preserve.enabled():
+        ascend_graph_preserve.ensure_available()
+
+    origin_build_model = agent_mod.BaseModelAgent.build_model
+    origin_build_cache_engine = agent_mod.BaseModelAgent.build_cache_engine
+    origin_get_free_mem = agent_mod.BaseModelAgent.get_free_mem
+    origin_update_params = agent_mod.BaseModelAgent.update_params
+    origin_sleep = agent_mod.BaseModelAgent.sleep
+    origin_wakeup = agent_mod.BaseModelAgent.wakeup
+    origin_release = agent_mod.BaseModelAgent.release
+
+    def _capture_ptr_snapshot(self):
+        snapshot = dict(weights=None, kv_cache=None, state_cache=None, state_caches=None, spec_kv_cache=None)
+        if self.patched_model is not None:
+            model = self.patched_model.get_model()
+            try:
+                name, param = next(model.named_parameters())
+                snapshot['weights'] = (name, param.data_ptr())
+            except StopIteration:
+                snapshot['weights'] = None
+        if self.cache_engine is not None and hasattr(self.cache_engine, 'full_gpu_cache'):
+            snapshot['kv_cache'] = self.cache_engine.full_gpu_cache.data_ptr()
+        if self.state_cache_engine is not None:
+            mem_pool = getattr(self.state_cache_engine, 'mem_pool', None)
+            if torch.is_tensor(mem_pool):
+                snapshot['state_cache'] = mem_pool.data_ptr()
+            state_caches = getattr(self.state_cache_engine, 'state_caches', ())
+            snapshot['state_caches'] = tuple(cache.data_ptr() for cache in state_caches if torch.is_tensor(cache))
+        spec_cache_engine = getattr(self.spec_agent, 'cache_engine', None)
+        if spec_cache_engine is not None and hasattr(spec_cache_engine, 'full_gpu_cache'):
+            snapshot['spec_kv_cache'] = spec_cache_engine.full_gpu_cache.data_ptr()
+        return snapshot
+
+    def _capture_input_buffer_snapshot(self):
+        if self.patched_model is None:
+            return {}
+        return capture_graph_input_buffer_snapshot(self.patched_model)
+
+    def _log_ptr_snapshot(action: str, rank: int, snapshot: dict):
+        logger.info(
+            'Ascend preserved graph %s rank[%s]: weight=%s kv_cache=%s state_cache=%s spec_kv_cache=%s',
+            action,
+            rank,
+            snapshot.get('weights'),
+            snapshot.get('kv_cache'),
+            snapshot.get('state_cache'),
+            snapshot.get('spec_kv_cache'),
+        )
+
+    def _log_input_buffer_snapshot(action: str, rank: int, snapshot: dict):
+        if not snapshot:
+            return
+        logger.debug(
+            'Ascend preserved graph %s rank[%s]: input_buffers=%s',
+            action,
+            rank,
+            snapshot,
+        )
+
+    def _assert_ptrs_unchanged(rank: int, before: dict, after: dict, tags: list[str]):
+        if 'weights' in tags and before.get('weights') != after.get('weights'):
+            raise RuntimeError(
+                f'Preserved-graph weight dataptr changed on rank[{rank}]: '
+                f'before={before.get("weights")} after={after.get("weights")}'
+            )
+        if 'kv_cache' in tags and before.get('kv_cache') != after.get('kv_cache'):
+            raise RuntimeError(
+                f'Preserved-graph kv_cache dataptr changed on rank[{rank}]: '
+                f'before={before.get("kv_cache")} after={after.get("kv_cache")}'
+            )
+        if 'kv_cache' in tags and before.get('state_cache') != after.get('state_cache'):
+            raise RuntimeError(
+                f'Preserved-graph state_cache dataptr changed on rank[{rank}]: '
+                f'before={before.get("state_cache")} after={after.get("state_cache")}'
+            )
+        if 'kv_cache' in tags and before.get('state_caches') != after.get('state_caches'):
+            raise RuntimeError(
+                f'Preserved-graph state_caches dataptr changed on rank[{rank}]: '
+                f'before={before.get("state_caches")} after={after.get("state_caches")}'
+            )
+        if 'kv_cache' in tags and before.get('spec_kv_cache') != after.get('spec_kv_cache'):
+            raise RuntimeError(
+                f'Preserved-graph spec kv_cache dataptr changed on rank[{rank}]: '
+                f'before={before.get("spec_kv_cache")} after={after.get("spec_kv_cache")}'
+            )
+
+    def _assert_input_buffer_snapshot_unchanged(rank: int, before: dict, after: dict):
+        if before != after:
+            raise RuntimeError(
+                f'Preserved-graph input_buffers changed on rank[{rank}]: '
+                f'before={before} after={after}'
+            )
+
+    def _format_num_bytes(num_bytes: int) -> str:
+        value = float(num_bytes)
+        units = ('B', 'KiB', 'MiB', 'GiB', 'TiB')
+        unit = units[0]
+        for candidate in units:
+            unit = candidate
+            if abs(value) < 1024.0 or candidate == units[-1]:
+                break
+            value /= 1024.0
+        if unit == 'B':
+            return f'{int(value)}{unit}'
+        return f'{value:.2f}{unit}'
+
+    def _save_preserved_model_buffers(self, level: int):
+        self._ascend_preserve_saved_model_buffers = {}
+        if level != 2 or self.patched_model is None:
+            return
+
+        model = self.patched_model.get_model()
+        saved_buffers = {}
+        saved_buffer_details = []
+        total_bytes = 0
+        for name, buffer in model.named_buffers():
+            if not torch.is_tensor(buffer) or buffer.device.type == 'meta':
+                continue
+            saved_buffers[name] = buffer.detach().cpu().clone()
+            num_bytes = buffer.numel() * buffer.element_size()
+            total_bytes += num_bytes
+            saved_buffer_details.append(
+                f'{name}:shape={tuple(buffer.shape)},dtype={buffer.dtype},size={_format_num_bytes(num_bytes)}'
+            )
+
+        self._ascend_preserve_saved_model_buffers = saved_buffers
+        if saved_buffers:
+            logger.info(
+                'Ascend preserved graph saved %s model buffers (%s) before level=2 sleep on rank[%s].',
+                len(saved_buffers),
+                _format_num_bytes(total_bytes),
+                self.rank,
+            )
+            logger.info(
+                'Ascend preserved graph saved model buffer details rank[%s]: %s',
+                self.rank,
+                saved_buffer_details,
+            )
+
+    def _restore_preserved_model_buffers(self):
+        saved_buffers = getattr(self, '_ascend_preserve_saved_model_buffers', None)
+        if not saved_buffers or self.patched_model is None:
+            return
+
+        model = self.patched_model.get_model()
+        current_buffers = dict(model.named_buffers())
+        restored = 0
+        skipped = []
+        for name, saved_buffer in saved_buffers.items():
+            buffer = current_buffers.get(name)
+            if buffer is None:
+                skipped.append(name)
+                continue
+            if tuple(buffer.shape) != tuple(saved_buffer.shape) or buffer.dtype != saved_buffer.dtype:
+                skipped.append(name)
+                continue
+            buffer.copy_(saved_buffer.to(device=buffer.device, non_blocking=True))
+            restored += 1
+
+        self._ascend_preserve_saved_model_buffers = {}
+        logger.info(
+            'Ascend preserved graph restored %s/%s model buffers after weight remap on rank[%s]. skipped=%s',
+            restored,
+            len(saved_buffers),
+            self.rank,
+            skipped[:8],
+        )
+
+    def _reset_preserved_weight_derived_caches(self):
+        if self.patched_model is None:
+            return
+        model = self.patched_model.get_model()
+        reset_count = 0
+        for _, mod in model.named_modules():
+            if hasattr(mod, 'A_log_exp'):
+                mod.A_log_exp = None
+                reset_count += 1
+        if reset_count:
+            logger.info(
+                'Ascend preserved graph reset %s Qwen3.5 A_log_exp caches on rank[%s].',
+                reset_count,
+                self.rank,
+            )
+
+    def _reset_preserved_runtime_caches(self):
+        reset_targets = []
+        if self.cache_engine is not None and hasattr(self.cache_engine, 'full_gpu_cache'):
+            self.cache_engine.full_gpu_cache.zero_()
+            reset_targets.append('kv_cache')
+
+        if self.state_cache_engine is not None:
+            state_caches = getattr(self.state_cache_engine, 'state_caches', ())
+            for cache in state_caches:
+                cache.zero_()
+            if len(state_caches) > 0:
+                reset_targets.append('state_cache')
+
+        spec_cache_engine = getattr(self.spec_agent, 'cache_engine', None)
+        if spec_cache_engine is not None and hasattr(spec_cache_engine, 'full_gpu_cache'):
+            spec_cache_engine.full_gpu_cache.zero_()
+            reset_targets.append('spec_kv_cache')
+
+        if reset_targets:
+            logger.info(
+                'Ascend preserved graph cold reset rank[%s]: zeroed_or_reset=%s',
+                self.rank,
+                ','.join(reset_targets),
+            )
+
+    def _build_model(self):
+        if not ascend_graph_preserve.enabled():
+            return origin_build_model(self)
+
+        ascend_graph_preserve.ensure_available()
+        with self.all_context(), ascend_graph_preserve.use_memory_pool('weights'):
+            self._build_model()
+            self.spec_agent.build_model(
+                self.misc_config.empty_init,
+                self.patched_model,
+                build_model_ctx=self.build_model_ctx,
+            )
+
+    def _build_cache_engine(self):
+        if not ascend_graph_preserve.enabled():
+            return origin_build_cache_engine(self)
+
+        ascend_graph_preserve.ensure_available()
+        with self.all_context(), ascend_graph_preserve.use_memory_pool('kv_cache'):
+            origin_build_cache_engine(self)
+            self._ascend_preserve_ptr_snapshot = _capture_ptr_snapshot(self)
+            _log_ptr_snapshot('build-cache', self.rank, self._ascend_preserve_ptr_snapshot)
+
+    def _get_free_mem(self):
+        if not ascend_graph_preserve.enabled():
+            return origin_get_free_mem(self)
+
+        with self.all_context():
+            torch.cuda.empty_cache()
+            gpu_mem_physical_free, _ = agent_mod.get_gpu_memory()
+            return gpu_mem_physical_free
+
+    @torch.inference_mode()
+    def _update_params(self, request):
+        ret = origin_update_params(self, request)
+        if ascend_graph_preserve.enabled() and getattr(request, 'finished', False):
+            with self.all_context():
+                _reset_preserved_weight_derived_caches(self)
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        return ret
+
+    @torch.inference_mode()
+    async def _sleep(self, level: int = 1):
+        if not ascend_graph_preserve.enabled():
+            return await origin_sleep(self, level)
+
+        ascend_graph_preserve.ensure_available()
+        self.state.is_sleeping = True
+        if self.dist_config.dp > 1:
+            await self.state.to_sleep.wait()
+        try:
+            with self.all_context():
+                _save_preserved_model_buffers(self, level)
+                self._ascend_preserve_ptr_snapshot = _capture_ptr_snapshot(self)
+                self._ascend_preserve_input_buffer_snapshot = _capture_input_buffer_snapshot(self)
+                _log_ptr_snapshot(f'pre-sleep(level={level})', self.rank, self._ascend_preserve_ptr_snapshot)
+                _log_input_buffer_snapshot(
+                    f'pre-sleep(level={level})',
+                    self.rank,
+                    self._ascend_preserve_input_buffer_snapshot,
+                )
+                # Drain in-flight ops referencing pool memory, then unmap. The trailing
+                # empty_cache() releases torch's default-pool cache (graph workspace
+                # spillover, IPC clone leftovers from update_params, restore-buffer
+                # device temps, sampler scratchpads). Without it, fragmentation grows
+                # every cycle because PRESERVE_GRAPHS=1 mandates expandable_segments=off.
+                torch.cuda.synchronize()
+                ascend_graph_preserve.sleep(level)
+                torch.cuda.empty_cache()
+        finally:
+            self.state.to_sleep.clear()
+
+    @torch.inference_mode()
+    def _wakeup(self, tags: list[str] | None = None):
+        if not ascend_graph_preserve.enabled():
+            return origin_wakeup(self, tags)
+
+        ascend_graph_preserve.ensure_available()
+        if tags is None:
+            tags = ['weights', 'kv_cache']
+
+        with self.all_context():
+            before = getattr(self, '_ascend_preserve_ptr_snapshot', None)
+            before_input_buffers = getattr(self, '_ascend_preserve_input_buffer_snapshot', None)
+            ascend_graph_preserve.wakeup(tags)
+            if 'weights' in tags:
+                _restore_preserved_model_buffers(self)
+                _reset_preserved_weight_derived_caches(self)
+            torch.cuda.synchronize()
+            if 'kv_cache' in tags:
+                self._debug_log_next_real_forward_after_wakeup = True
+                _reset_preserved_runtime_caches(self)
+                torch.cuda.synchronize()
+            after = _capture_ptr_snapshot(self)
+            after_input_buffers = _capture_input_buffer_snapshot(self)
+            _log_ptr_snapshot(f'post-wakeup(tags={tags})', self.rank, after)
+            _log_input_buffer_snapshot(f'post-wakeup(tags={tags})', self.rank, after_input_buffers)
+            if before is not None:
+                _assert_ptrs_unchanged(self.rank, before, after, tags)
+                logger.info(
+                    'Ascend preserved graph dataptr check passed on rank[%s] for tags=%s',
+                    self.rank,
+                    tags,
+                )
+            if before_input_buffers:
+                _assert_input_buffer_snapshot_unchanged(self.rank, before_input_buffers, after_input_buffers)
+                logger.info(
+                    'Ascend preserved graph input-buffer check passed on rank[%s] for tags=%s',
+                    self.rank,
+                    tags,
+                )
+            self._ascend_preserve_ptr_snapshot = after
+            self._ascend_preserve_input_buffer_snapshot = after_input_buffers
+            # Release torch default-pool cache picked up by the wakeup path:
+            # CPU->NPU intermediate tensors from buffer restore, dropped A_log_exp
+            # caches, and stale per-iteration scratchpads from the prior rollout.
+            # Mirrors the empty_cache that the original sleep() relied on.
+            torch.cuda.empty_cache()
+        if 'kv_cache' in tags:
+            self.state.is_sleeping = False
+            if self.dist_config.dp > 1:
+                self.state.to_wakeup.set()
+            print(f'=====> ModelAgent rank[{self.rank}] wakeup done.')
+
+    def _release(self):
+        if not ascend_graph_preserve.enabled():
+            return origin_release(self)
+
+        self.reset_graph_runner()
+        self.patched_model = None
+        self.cache_engine = None
+        self.state_cache_engine = None
+        self.state.is_sleeping = False
+
+    def _get_pt_weights_iterator(file: str, prefix: str):
+        state = torch.load(file, weights_only=True, map_location='cpu')
+        try:
+            if prefix is None:
+                yield from state.items()
+            else:
+                for k, v in state.items():
+                    yield f'{prefix}{k}', v
+        finally:
+            del state
+            if not ascend_graph_preserve.skip_empty_cache():
+                torch.cuda.empty_cache()
+
+    agent_mod.BaseModelAgent.build_model = _build_model
+    agent_mod.BaseModelAgent.build_cache_engine = _build_cache_engine
+    agent_mod.BaseModelAgent.get_free_mem = _get_free_mem
+    agent_mod.BaseModelAgent.update_params = _update_params
+    agent_mod.BaseModelAgent.sleep = _sleep
+    agent_mod.BaseModelAgent.wakeup = _wakeup
+    agent_mod.BaseModelAgent.release = _release
+    weight_loader_mod._get_pt_weights_iterator = _get_pt_weights_iterator
+    agent_mod.BaseModelAgent._dlinfer_ascend_preserve_graph_patched = True
+
+
 def patch_gated_delta_net():
     import torch.nn.functional as F
     from typing import Any, Sequence, Tuple
@@ -298,7 +682,7 @@ def patch_gated_delta_net():
             """
             out = self.causal_conv1d_fn(
                 x.t(),
-                weight.t().contiguous(),
+                weight,
                 bias,
                 activation=self.activation,
                 conv_states=conv_state.transpose(1, 2),
@@ -323,7 +707,7 @@ def patch_gated_delta_net():
             out = self.causal_conv1d_update(
                 x,
                 conv_state,
-                weight,
+                weight.t().contiguous(),
                 bias,
                 self.activation,
                 conv_state_indices=conv_state_indices,
@@ -384,8 +768,8 @@ def patch_gated_delta_net():
                 core_attn_out = self.fused_sigmoid_gating_delta_rule_update(
                     A_log=A_log,
                     dt_bias=dt_bias,
-                    q=query,
-                    k=key,
+                    q=query.contiguous(),
+                    k=key.contiguous(),
                     v=value.contiguous(),
                     a=a.contiguous(),
                     b=b.contiguous(),
@@ -407,7 +791,7 @@ def patch_gated_delta_net():
                 core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
                     q=query,
                     k=key,
-                    v=value,
+                    v=value.contiguous(),
                     g=g,
                     beta=beta,
                     initial_state=initial_state,
@@ -441,6 +825,7 @@ def patch_qwen3_5():
     from lmdeploy.utils import is_bf16_supported
     from lmdeploy.pytorch.configurations.default import DefaultModelConfigBuilder
     from lmdeploy.pytorch.configurations.qwen3_next import _check_env_qwen3_next
+    from lmdeploy.vl.constants import Modality
 
     from lmdeploy.pytorch.weight_loader.model_weight_loader import default_weight_loader
     from lmdeploy.pytorch.nn.gated_delta import GatedDeltaMeta, CausalConv1d
@@ -495,7 +880,7 @@ def patch_qwen3_5():
         # construction. Storing num_delta_layers as the first shape dim would require a
         # transpose later, producing non-contiguous views.
         cfg.states_shapes = [(conv_state_shape, dtype)] * num_delta_layers + [
-            (recurrent_state_shape, dtype)
+            (recurrent_state_shape, torch.float32)
         ] * num_delta_layers
 
         cfg.is_gated_delta = True
@@ -639,7 +1024,10 @@ def patch_qwen3_5():
         # beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         # g = self.get_A_log_exp() * F.softplus(a.float() + self.dt_bias)
-        if self.kv_ratio > 1:
+        # For decoding, the fused_sigmoid_gating_delta_rule_update kernel handles
+        # GQA natively via i_h = i_hv // (HV // H), so repeat_interleave is not needed.
+        # For prefill, chunk_gated_delta_rule requires H == HV (no native GQA support).
+        if self.kv_ratio > 1 and not gated_delta_meta.is_decoding:
             query = query.repeat_interleave(self.kv_ratio, dim=-2)
             key = key.repeat_interleave(self.kv_ratio, dim=-2)
 
@@ -677,12 +1065,20 @@ def patch_qwen3_5():
         v = v.chunk(self.tp, dim=0)[self.rank]
         loaded_weight = torch.cat([q, k, v], dim=0)
         default_weight_loader(param, loaded_weight)
+        
 
-        if param is self.weight:
-            param.data = param.data.transpose(0, 2).contiguous()
+        # logger.error("------------------------- dlinfer patch conv1d update weights")
+        #if param is self.weight:
+        #    param.data = param.data.transpose(0, 2).contiguous()
 
-    CausalConv1d.weight_loader = custom_weight_loader
+    def custom_update_weights(self):
+        """Reset derived weight caches after external weight updates."""
+        self.A_log_exp = None
+
+    # logger.error("-------------------- dlinfer patch fun")
+    # CausalConv1d.weight_loader = custom_weight_loader
     Qwen3_5GatedDeltaNet.forward = custom_forward
+    Qwen3_5GatedDeltaNet.update_weights = custom_update_weights
     Qwen3_5ModelConfigBuilder.build = custom_build
     Qwen3_5ForConditionalGeneration.prepare_inputs_for_generation = (
         custom_prepare_inputs_for_generation
@@ -697,6 +1093,7 @@ def vendor_device_init():
         patch_contiguous_cache_engine()
     if vendor_name == "ascend":
         patch_state_cache_engine()
+        patch_ascend_preserved_graph_sleep()
         patch_gated_delta_net()
         patch_qwen3_5()
 

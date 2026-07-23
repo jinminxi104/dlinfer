@@ -24,6 +24,33 @@ logger = get_logger("dlinfer")
 BuffType = Dict[str, Tensor]
 
 
+def _buffer_sample_signature(tensor: Tensor) -> dict:
+    return dict(
+        data_ptr=tensor.data_ptr(),
+        shape=tuple(tensor.shape),
+        dtype=str(tensor.dtype),
+    )
+
+
+def capture_graph_input_buffer_snapshot(graph_runner) -> dict[str, dict[str, dict]]:
+    snapshot: dict[str, dict[str, dict]] = {}
+    runner_map = getattr(graph_runner, "_runner_map", None)
+    if not isinstance(runner_map, dict):
+        return snapshot
+
+    for key, runner in runner_map.items():
+        meta = getattr(runner, "meta", None)
+        input_buffers = getattr(meta, "input_buffers", None) if meta is not None else None
+        if not isinstance(input_buffers, dict):
+            continue
+        snapshot[repr(key)] = {
+            name: _buffer_sample_signature(buffer)
+            for name, buffer in sorted(input_buffers.items())
+            if torch.is_tensor(buffer)
+        }
+    return snapshot
+
+
 @functools.lru_cache()
 def aclgraph_use_torch_npu_update():
     min_valid_version = Version("2.8.0.post1")
@@ -229,10 +256,14 @@ def next_power_of_2(n: int):
 
 def get_ascend_compatible_size(n: int):
     """Get ascend compatible size."""
-    if n <= 16:
+    if n <= 8:
         n = next_power_of_2(n)
+    elif n <= 12:
+        n = 12
+    elif n <= 16:
+        n = 16
     elif n <= 256:
-        n = (n + 15) & ~0xF
+        n = (n + 7) & ~0x07 # round up to nearest multiple of 8 
     else:
         n = (((n - 1) >> 8) + 1) << 8
     return n
@@ -534,10 +565,11 @@ class GraphParams:
 
 
 _graph_params: Optional[GraphParams] = None
-
+# _graph_capture_sizes: set[int] = None
 
 def set_graph_params(aclgraph_capture_sizes: set[int]):
     global _graph_params
+    # global _graph_capture_sizes
     if _graph_params is not None:
         raise ValueError("Graph parameters have already been set!")
     _graph_params = GraphParams(
@@ -547,6 +579,7 @@ def set_graph_params(aclgraph_capture_sizes: set[int]):
         attn_params={size: [] for size in aclgraph_capture_sizes},
         is_mla=False,
     )
+    # _graph_capture_sizes = aclgraph_capture_sizes
 
 
 def get_graph_params():
@@ -571,6 +604,14 @@ def clear_graph_params():
         _graph_params.workspaces.clear()
     finally:
         _graph_params = None
+    #     global _graph_capture_sizes
+    # _graph_params = GraphParams(
+    #     events={size: [] for size in _graph_capture_sizes},
+    #     workspaces={size: None for size in _graph_capture_sizes},
+    #     handles={size: [] for size in _graph_capture_sizes},
+    #     attn_params={size: [] for size in _graph_capture_sizes},
+    #     is_mla=False,
+    # )
 
 
 def update_attn_params(update_stream, forward_meta, runtime_size):
